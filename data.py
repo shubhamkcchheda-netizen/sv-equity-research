@@ -71,17 +71,26 @@ class NSEClient:
         self.s = requests.Session()
         self.s.headers.update(self.HEADERS)
         self._warm = False
+        self.blocked_until = 0.0  # after a failure NSE is skipped for a while (cloud servers are often blocked)
 
     def _get(self, path: str) -> dict:
-        if not self._warm:
-            self.s.get(self.BASE, timeout=8)
-            self._warm = True
-        r = self.s.get(self.BASE + path, timeout=8)
-        if r.status_code in (401, 403):  # cookies expired -> refresh once
-            self.s.get(self.BASE, timeout=8)
-            r = self.s.get(self.BASE + path, timeout=8)
-        r.raise_for_status()
-        return r.json()
+        import time as _t
+        if _t.time() < self.blocked_until:
+            raise RuntimeError("NSE temporarily skipped")
+        try:
+            if not self._warm:
+                self.s.get(self.BASE, timeout=4)
+                self._warm = True
+            r = self.s.get(self.BASE + path, timeout=4)
+            if r.status_code in (401, 403):  # cookies expired -> refresh once
+                self.s.get(self.BASE, timeout=4)
+                r = self.s.get(self.BASE + path, timeout=4)
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            self.blocked_until = _t.time() + 600  # try NSE again in 10 minutes
+            self._warm = False
+            raise
 
     def quote(self, symbol: str) -> dict:
         j = self._get(f"/api/quote-equity?symbol={urlquote(to_nse(symbol))}")
@@ -140,13 +149,40 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+class DataUnavailable(Exception):
+    """Yahoo returned nothing (usually a short rate limit). Raised so callers don't cache the empty answer."""
+
+
+def _fetch(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    import time as _t
+    t = to_yahoo(symbol)
+    for attempt in range(2):
+        try:
+            df = _clean(yf.Ticker(t).history(period=period, interval=interval, auto_adjust=True))
+            if len(df):
+                return df
+        except Exception:
+            pass
+        try:
+            raw = yf.download(t, period=period, interval=interval, auto_adjust=True, progress=False, threads=False)
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
+            df = _clean(raw)
+            if len(df):
+                return df
+        except Exception:
+            pass
+        _t.sleep(1.5)
+    raise DataUnavailable(f"No data from Yahoo for {symbol} ({period}, {interval})")
+
+
 def history(symbol: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
-    return _clean(yf.Ticker(to_yahoo(symbol)).history(period=period, interval=interval, auto_adjust=True))
+    return _fetch(symbol, period, interval)
 
 
 def intraday(symbol: str, interval: str = "5m", days: int = 5) -> pd.DataFrame:
     # Yahoo limits: 1m -> 7 days, 5m/15m -> 60 days
-    return _clean(yf.Ticker(to_yahoo(symbol)).history(period=f"{days}d", interval=interval, auto_adjust=True))
+    return _fetch(symbol, f"{days}d", interval)
 
 
 def history_many(symbols: list[str], period: str = "2y") -> dict[str, pd.DataFrame]:
