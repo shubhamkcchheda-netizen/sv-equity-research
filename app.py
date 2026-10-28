@@ -14,10 +14,13 @@ import analysis as A
 import data as D
 import patterns as P
 import scalp as SC
+import engine as EN
 import symbols as S
 
 APP_NAME = "SV Equity Research Analyzer"
-st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
+import os as _os0
+_LOGO = _os0.path.join(_os0.path.dirname(_os0.path.abspath(__file__)), "sv_logo.png")
+st.set_page_config(page_title=APP_NAME, page_icon=_LOGO if _os0.path.exists(_LOGO) else "📈", layout="wide")
 
 UP, DOWN, NEUTRAL = "#16a34a", "#dc2626", "#64748b"
 
@@ -25,19 +28,68 @@ UP, DOWN, NEUTRAL = "#16a34a", "#dc2626", "#64748b"
 # ----------------------------------------------------------------------------
 # Cached data access
 # ----------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
-def get_history(sym, period):
+# Empty answers raise inside the cached functions, so a short Yahoo hiccup is never remembered.
+@st.cache_data(ttl=600, show_spinner=False)
+def _history_cached(sym, period):
     return D.history(sym, period=period)
 
 
+def get_history(sym, period):
+    """Daily candles. Falls back to the background engine's copy, then to a shorter period."""
+    try:
+        return _history_cached(sym, period)
+    except Exception:
+        pass
+    try:
+        df = get_engine().daily.get(sym)
+        if df is not None and len(df) >= 60:
+            return df.copy()
+    except Exception:
+        pass
+    if period not in ("1y", "6mo"):
+        try:
+            return _history_cached(sym, "1y")
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+
 @st.cache_data(ttl=20, show_spinner=False)
-def get_intraday(sym, interval, days):
+def _intraday_cached(sym, interval, days):
     return D.intraday(sym, interval, days)
 
 
-@st.cache_data(ttl=1, show_spinner=False)
-def get_quote(sym):
+def get_intraday(sym, interval, days):
+    try:
+        return _intraday_cached(sym, interval, days)
+    except Exception:
+        try:  # today's 1-minute candles from the background engine
+            b = get_engine().bars.get(sym)
+            if b is not None and len(b):
+                return b if interval == "1m" else SC.resample(b, int(interval[:-1]))
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=2, show_spinner=False)
+def _quote_cached(sym):
     return D.live_quote(sym)
+
+
+def get_quote(sym):
+    try:
+        return _quote_cached(sym)
+    except Exception:
+        p = get_engine().price(sym)  # last price the engine saw (≤1 min old)
+        if not p:
+            raise
+        return {"source": "Engine (≤1 min)", "name": sym, "last": p["last"],
+                "change": p["last"] - (p["prev_close"] or p["last"]),
+                "pchange": p["day_pct"] if pd.notna(p["day_pct"]) else 0.0,
+                "prev_close": p["prev_close"] or p["last"], "open": p["open"], "day_high": p["high"],
+                "day_low": p["low"], "high_52w": p["high"], "low_52w": p["low"], "vwap": None,
+                "time": p["time"].strftime("%d-%b-%Y %H:%M")}
 
 
 FREQ = {"1m": "1min", "5m": "5min", "15m": "15min"}
@@ -148,6 +200,40 @@ def signal_badge(verdict: str, score: float, label: str, conf: float | None = No
     return (f"<div class='sig-badge' style='background:{SIGNAL_BG[verdict]}'>"
             f"<div class='lbl'>{label}</div><div class='big'>{arrow} {text}</div>"
             f"<div>{sub}</div></div>")
+
+
+@st.cache_resource(show_spinner=False)
+def get_engine():
+    """One background engine for the whole app: scans, live prices, call tracking."""
+    import os as _o
+    store = None
+    try:
+        tok, repo = st.secrets.get("GITHUB_TOKEN"), st.secrets.get("GITHUB_REPO")
+        if tok and repo:
+            store = EN.GitHubStore(str(tok), str(repo))
+    except Exception:
+        store = None  # no secrets set up: report is kept only until the app restarts
+    return EN.Engine(sorted(S.BUILTIN), D.DEFAULT_WATCHLIST,
+                     _o.path.join(_o.path.dirname(_o.path.abspath(__file__)), "calls_log.json"), store=store)
+
+
+STATUS_LABEL = {
+    "open": "⏳ Running", "T1 hit (running)": "✅ T1 hit · ⅓ booked, running",
+    "T2 hit (running)": "✅✅ T2 hit · ⅔ booked, running",
+    "T1 hit": "✅ T1 hit · ⅓ booked, rest out at cost", "T2 hit": "✅✅ T2 hit · ⅔ booked, rest out at T1",
+    "T3 hit": "🏆 T3 hit · all targets",
+    "Stop hit": "❌ Stop hit (wrong)", "Closed (no target)": "⏹ Closed 3:15 · no target",
+}
+
+
+def status_colour(v: str) -> str:
+    if "❌" in v or "Back below" in v or "Back above" in v:
+        return "background-color:#dc2626;color:white;font-weight:700"
+    if "🏆" in v or "✅" in v:
+        return "background-color:#16a34a;color:white;font-weight:700"
+    if "⏳" in v or "Holding" in v:
+        return "background-color:rgba(202,138,4,.18);font-weight:600"
+    return "color:#64748b"
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -281,6 +367,47 @@ with st.sidebar:
     min_conf = st.slider("Only show BUY/SELL above confidence", 50, 90, 60, 5, format="%d%%",
                          help="Confidence = how much of the indicator weight agrees with the signal. "
                               "Below this the app says WAIT.")
+    st.divider()
+    st.markdown("**🎯 High-Accuracy Mode**")
+    a_plus = st.toggle("Only A+ setups", True, key="f_aplus",
+                       help="A call only when everything lines up: confidence ≥80%, market moving our way, price "
+                            "on the right side of VWAP, volume with us, move just starting, 9:45–11:00 or "
+                            "1:30–2:45, max 3 calls per stock, stop ≥0.25%. Expect 5–15 calls a day.")
+    target_ratio = st.select_slider("Target 1 size (vs stop-loss)", options=[0.5, 0.75, 1.0], value=1.0, key="f_tr",
+                                    format_func=lambda v: {0.5: "½× (high accuracy, small wins)",
+                                                           0.75: "¾×", 1.0: "1× (balanced)"}[v],
+                                    help="A smaller target is hit more often but each win is smaller. "
+                                         "Judge it by Net P&L after costs in the report, not accuracy alone.")
+    trade_amt = st.number_input("Amount per trade for P&L (₹)", 5000, 10_000_000, 100_000, 5000, key="f_amt")
+    st.markdown("**🔔 Pop-up alerts**")
+    alerts_on = st.toggle("Pop up the strongest BUY/SELL setups", True, key="al_on")
+    alert_conf = st.slider("Pop up when confidence ≥", 70, 100, 90, 5, format="%d%%", key="al_conf",
+                           help="100% = every indicator points the same way. It is not a guarantee: "
+                                "the stop-loss can still be hit.")
+    with st.expander("🛡️ Smart filters (learned from 23 Oct report)", expanded=False):
+        st.caption("Block the setups that lost most often. Blocked signals are still tracked in the report, "
+                   "so you can see every day whether the filters help.")
+        SMART = {
+            "market_filter": st.toggle("Trade only with the market's direction", True, key="f_mkt",
+                                       help="23 Oct: against the market 41% right, with it 52%. Morning BUYs "
+                                            "while NIFTY fell were right only 23%."),
+            "mkt_threshold": 0.05,
+            "skip_midday": st.toggle("Skip 11:00–1:30 chop", True, key="f_mid",
+                                     help="23 Oct: 11–12 → 44%, 12–1:30 → 38% right."),
+            "cooldown_after_loss": st.slider("Wait after a stop-loss (min)", 0, 60, 30, 5, key="f_cool",
+                                             help="23 Oct: next call right after a stop was right only 42%."),
+            "no_flip_minutes": st.slider("No BUY↔SELL flip within (min)", 0, 30, 15, 5, key="f_flip"),
+            "max_per_stock": st.slider("Max scalp calls per stock per day", 2, 40, 8, 1, key="f_max",
+                                       help="23 Oct: first 5 calls 59% right; calls 11–20 only 40%."),
+            "min_stop_pct": st.slider("Minimum stop-loss distance (%)", 0.0, 0.5, 0.15, 0.05, key="f_stop",
+                                      help="23 Oct: median stop was 0.17%; 37% of losses were stopped within "
+                                           "3 minutes (noise). Stops ≥0.30% were right 60%."),
+            "max_stretch": st.slider("Don't chase after a move of (%)", 0.5, 5.0, 1.5, 0.25, key="f_stretch",
+                                     help="23 Oct: calls after the stock already moved >1% our way: 43–46%; "
+                                          "calls early in the move (0–0.5%): 62%."),
+            "one_at_a_time": st.toggle("One running call per stock", True, key="f_one"),
+        }
+    SMART = {**SC.DEFAULT_FILTERS, **SMART, "a_plus": a_plus, "target_ratio": target_ratio}
     rf = st.number_input("Risk-free rate (%/yr)", 0.0, 15.0, 6.5, 0.25) / 100
     st.divider()
     is_open, status = D.market_status()
@@ -293,8 +420,13 @@ LIVE_EVERY = (refresh if D.market_status()[0] else max(refresh, 60)) if refresh 
 
 
 # ----------------------------------------------------------------------------
-# Stock search (type a few letters of the name or symbol)
+# Brand banner, then stock search (type a few letters of the name or symbol)
 # ----------------------------------------------------------------------------
+st.markdown(
+    "<div class='sv-brand'><div class='sv-mono'>SV</div><div>"
+    "<div class='sv-word'>SV Equity Research <em>Analyzer</em></div>"
+    "<div class='sv-tag'>NSE live signals · breakouts · patterns · scalping</div></div></div>",
+    unsafe_allow_html=True)
 stocks, list_source = get_stock_list()
 labels = (stocks["SYMBOL"] + "  ·  " + stocks["NAME"]).tolist()
 sym_of = dict(zip(labels, stocks["SYMBOL"]))
@@ -330,11 +462,10 @@ symbol = st.session_state.symbol
 # ----------------------------------------------------------------------------
 @st.fragment(run_every=LIVE_EVERY)
 def live_header():
-    cols = st.columns([2.2, 1.3, 1, 1, 1])
     try:
         q = get_quote(symbol)
-    except Exception as e:
-        cols[0].error(f"Could not get a quote for **{symbol}**: {e}")
+    except Exception:
+        st.warning(f"Live price for **{symbol}** is not available right now; retrying automatically.")
         return
     # Tick direction vs the previous refresh -> green/red flash
     key = f"last_px_{symbol}"
@@ -345,41 +476,54 @@ def live_header():
     day_color = UP if q["change"] >= 0 else DOWN
     px_color = UP if tick == "tick-up" else DOWN if tick == "tick-down" else day_color
     is_open = D.market_status()[0]
-    live = "<span class='live-dot'></span>LIVE" if (is_open and refresh) else "⏸ market closed" if not is_open else "auto-refresh off"
-    cols[0].markdown(
+    live = ("<span class='live-dot'></span>LIVE" if (is_open and refresh)
+            else "⏸ market closed" if not is_open else "auto-refresh off")
+    left, right = st.columns([1.6, 1])
+    left.markdown(
         f"<div class='{tick}' style='border-radius:10px;padding:4px 8px'>"
         f"<b style='font-size:1.3em'>{q['name']}</b> <span style='color:{NEUTRAL};font-size:0.8em'>NSE: {symbol}</span><br>"
-        f"<span style='font-size:2.3em;font-weight:800;color:{px_color}'>{inr(q['last'])} {arrow}</span> "
-        f"<span style='background:{day_color};color:#fff;border-radius:6px;padding:2px 8px;font-weight:700'>"
-        f"{q['change']:+,.2f} ({q['pchange']:+.2f}%)</span><br>"
+        f"<span style='display:inline-flex;flex-wrap:wrap;align-items:center;gap:10px'>"
+        f"<span style='font-size:2.3em;font-weight:800;color:{px_color};white-space:nowrap'>{inr(q['last'])} {arrow}</span>"
+        f"<span style='background:{day_color};color:#fff;border-radius:6px;padding:3px 10px;font-weight:700;white-space:nowrap'>"
+        f"{q['change']:+,.2f} ({q['pchange']:+.2f}%)</span></span><br>"
         f"<span style='font-size:0.8em;color:{NEUTRAL}'>{live} · {q['source']} · {q['time']}</span></div>",
         unsafe_allow_html=True,
     )
     # Live signal: intraday candles + the tick just received
-    try:
-        idf = apply_tick(get_intraday(symbol, live_iv, 5), q["last"], live_iv)
-        if len(idf) >= 30:
-            lp = A.trade_plan(A.add_indicators(idf, intraday=True), capital, risk_pct, min_conf)
-            cols[1].markdown(signal_badge(lp["verdict"], lp["score"], f"Live signal ({live_iv})", lp["confidence"]),
-                             unsafe_allow_html=True)
-    except Exception:
-        cols[1].caption("Live signal unavailable")
-    cols[2].metric("Day range", f"{q['day_low']:,.1f} – {q['day_high']:,.1f}",
-                   f"Open {q['open']:,.1f}", delta_color="off")
-    cols[3].metric("52W range", f"{q['low_52w']:,.0f} – {q['high_52w']:,.0f}",
-                   f"{(q['last'] / q['high_52w'] - 1) * 100:.1f}% from high", delta_color="off")
+    with right:
+        try:
+            idf = apply_tick(get_intraday(symbol, live_iv, 5), q["last"], live_iv)
+            if len(idf) >= 30:
+                lp = A.trade_plan(A.add_indicators(idf, intraday=True), capital, risk_pct, min_conf)
+                st.markdown(signal_badge(lp["verdict"], lp["score"], f"Live signal ({live_iv})", lp["confidence"]),
+                            unsafe_allow_html=True)
+            else:
+                st.caption("Live signal: waiting for intraday candles…")
+        except Exception:
+            st.caption("Live signal unavailable right now")
+    # Stats strip: wraps onto more lines on a phone instead of cutting numbers off
     try:
         n = get_quote(bench_sym)
-        cols[4].metric(bench_name, f"{n['last']:,.2f}", f"{n['pchange']:+.2f}%")
+        nifty_val, nifty_sub, nifty_col = f"{n['last']:,.2f}", f"{n['pchange']:+.2f}% today", UP if n["pchange"] >= 0 else DOWN
     except Exception:
-        cols[4].metric(bench_name, "—")
+        nifty_val, nifty_sub, nifty_col = "—", "not available", NEUTRAL
+    pos52 = ((q["last"] - q["low_52w"]) / (q["high_52w"] - q["low_52w"]) * 100) if q["high_52w"] > q["low_52w"] else np.nan
 
+    def card(label, value, sub, sub_col=NEUTRAL):
+        return (f"<div style='border:1px solid rgba(100,116,139,.25);border-radius:10px;padding:8px 12px;min-width:0'>"
+                f"<div style='font-size:.75em;letter-spacing:.06em;text-transform:uppercase;opacity:.7'>{label}</div>"
+                f"<div style='font-family:JetBrains Mono,ui-monospace,monospace;font-weight:700;font-size:1.05em;"
+                f"font-variant-numeric:tabular-nums;overflow-wrap:anywhere'>{value}</div>"
+                f"<div style='font-size:.8em;color:{sub_col}'>{sub}</div></div>")
+    st.markdown(
+        "<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:4px 0 8px'>"
+        + card("Day low – high", f"{q['day_low']:,.1f} –<wbr> {q['day_high']:,.1f}", f"Open {q['open']:,.1f}")
+        + card("Previous close", f"{q['prev_close']:,.2f}", f"VWAP {q['vwap']:,.2f}" if q.get("vwap") else "&nbsp;")
+        + card("52-week low – high", f"{q['low_52w']:,.0f} – {q['high_52w']:,.0f}",
+               f"at {pos52:.0f}% of the range" if pd.notna(pos52) else "&nbsp;")
+        + card(bench_name, nifty_val, nifty_sub, nifty_col)
+        + "</div>", unsafe_allow_html=True)
 
-st.markdown(
-    "<div class='sv-brand'><div class='sv-mono'>SV</div><div>"
-    "<div class='sv-word'>SV Equity Research <em>Analyzer</em></div>"
-    "<div class='sv-tag'>NSE live signals · breakouts · patterns · scalping</div></div></div>",
-    unsafe_allow_html=True)
 live_header()
 
 # ----------------------------------------------------------------------------
@@ -389,15 +533,160 @@ with st.spinner(f"Loading {symbol} history…"):
     raw = get_history(symbol, period)
     bench_raw = get_history(bench_sym, period)
 if raw.empty:
-    st.error(f"No data for **{symbol}**. Check the NSE symbol (e.g. RELIANCE, TATASTEEL, HDFCBANK).")
+    st.warning(f"⏳ Chart history for **{symbol}** isn't available from Yahoo Finance right now (it limits "
+               "how often data can be downloaded). The app retries by itself every 20 seconds; the live price "
+               "above keeps updating. If it lasts more than a few minutes, check the symbol.")
+
+    @st.fragment(run_every=20)
+    def _retry_history():
+        try:
+            _history_cached(symbol, period)
+            st.rerun()
+        except Exception:
+            st.caption(f"Last try {pd.Timestamp.now(tz='Asia/Kolkata'):%H:%M:%S}: still waiting for Yahoo…")
+
+    _retry_history()
     st.stop()
 
 d = A.add_indicators(raw)
 plan = A.trade_plan(d, capital, risk_pct, min_conf)
 
-tab_sig, tab_pos, tab_brk, tab_pat, tab_scalp, tab_intra, tab_cmp, tab_scan, tab_bt, tab_fund = st.tabs(
-    ["🎯 Signal & Chart", "💼 My Positions", "🚀 Breakouts", "🕯️ Patterns", "⚡ Scalping", "⏱️ Intraday Live", "⚖️ vs NIFTY & Peers", "🔎 Scanner", "🧪 Backtest", "🏢 Fundamentals"]
-)
+ENGINE = get_engine()
+ENGINE.cfg.update(SMART)
+
+PAGES = ["🎯 Signal", "📊 Live Report", "🚀 Breakouts", "⚡ Scalping", "💼 My Positions", "🕯️ Patterns",
+         "⏱️ Intraday", "⚖️ vs NIFTY", "🔎 Scanner", "🧪 Backtest", "🏢 Fundamentals", "📘 Guide"]
+# Only the open section is computed -> much faster than tabs (which compute every tab every refresh)
+if "_goto" in st.session_state:
+    st.session_state.page = st.session_state.pop("_goto")
+_nav = getattr(st, "segmented_control", None)
+if _nav:
+    page = _nav("Section", PAGES, default=PAGES[0], key="page", label_visibility="collapsed") or PAGES[0]
+else:
+    page = st.radio("Section", PAGES, horizontal=True, key="page", label_visibility="collapsed")
+
+
+@st.fragment(run_every=LIVE_EVERY)
+def market_mood():
+    ms = ENGINE.market_state()
+    mood = ms["mood"]
+    col = UP if mood.startswith("Buyers") else DOWN if mood.startswith("Sellers") else "#ca8a04" if mood != "Unknown" else NEUTRAL
+    icon = "🟢" if mood.startswith("Buyers") else "🔴" if mood.startswith("Sellers") else "🟡" if mood != "Unknown" else "⚪"
+    bits = []
+    if ms["nifty"]:
+        bits.append(f"NIFTY <b>{ms['nifty']:,.1f}</b>" + (f" ({ms['nifty_pct']:+.2f}% today)" if pd.notna(ms["nifty_pct"]) else ""))
+    if pd.notna(ms["mkt30"]):
+        bits.append(f"last 30 min <b>{ms['mkt30']:+.2f}%</b>")
+    if pd.notna(ms["breadth"]):
+        bits.append(f"<b>{ms['breadth']:.0f}%</b> of stocks up")
+    if pd.notna(ms["above_vwap"]):
+        bits.append(f"<b>{ms['above_vwap']:.0f}%</b> above VWAP")
+    hint = ("BUY setups favoured" if mood.startswith("Buyers") else "SELL setups favoured" if mood.startswith("Sellers")
+            else "be selective, smaller size" if mood != "Unknown" else "waiting for market data")
+    st.markdown(
+        f"<div style='display:flex;gap:12px;flex-wrap:wrap;align-items:center;border:1.5px solid {col};"
+        f"border-radius:12px;padding:8px 14px;margin:4px 0 10px;font-variant-numeric:tabular-nums'>"
+        f"<b style='color:{col}'>{icon} Market: {mood}</b><span>{' · '.join(bits)}</span>"
+        f"<span style='opacity:.75;font-size:.85em'>→ {hint}</span></div>", unsafe_allow_html=True)
+
+
+market_mood()
+
+
+def live_px(sym: str) -> tuple[float | None, float | None]:
+    """Freshest price we have: 1-second quote for the stock on screen, engine price for the rest."""
+    if sym == symbol:
+        try:
+            q = get_quote(sym)
+            return float(q["last"]), float(q["pchange"])
+        except Exception:
+            pass
+    p = ENGINE.price(sym)
+    return (p["last"], p["day_pct"]) if p else (None, None)
+
+
+def trade_cost(amount: float, source: str = "Scalp") -> float:
+    """Approximate Indian equity charges for one round trip (buy + sell) at a discount broker.
+    Scalp = intraday; Breakout = delivery (held overnight)."""
+    exch = 2 * amount * 0.0000297          # NSE transaction charges
+    sebi = 2 * amount * 0.000001
+    if source == "Breakout":
+        brokerage = 0.0
+        stt = 2 * amount * 0.001           # 0.1% on buy and on sell
+        stamp = amount * 0.00015
+        dp = 15.93                         # depository charge on the sell day
+    else:
+        brokerage = 2 * min(20.0, amount * 0.0003)
+        stt = amount * 0.00025             # 0.025% on the sell side
+        stamp = amount * 0.00003
+        dp = 0.0
+    gst = 0.18 * (brokerage + exch + sebi)
+    return brokerage + stt + exch + sebi + stamp + gst + dp
+
+
+def today_calls(source: str | None = None) -> pd.DataFrame:
+    c = ENGINE.snapshot_calls()
+    if c.empty:
+        return c
+    c = c[c["time"].map(lambda t: t.date()) == pd.Timestamp.now(tz="Asia/Kolkata").date()]
+    return c[c.source == source] if source else c
+
+
+def open_stock(sym: str, target_page: str):
+    name = stocks.loc[stocks.SYMBOL == sym, "NAME"]
+    st.session_state.extra_label = f"{sym}  ·  {name.iloc[0] if len(name) else sym}"
+    st.session_state.symbol = sym
+    st.session_state.pop("stock_pick", None)
+    st.session_state._goto = target_page
+    st.rerun()
+
+
+@st.fragment(run_every=LIVE_EVERY)
+def alerts_bar():
+    if not alerts_on:
+        return
+    c = ENGINE.snapshot_calls()
+    if c.empty:
+        return
+    now = pd.Timestamp.now(tz="Asia/Kolkata")
+    if "taken" not in c:
+        c["taken"] = True
+    c = c[(c["time"] >= now - pd.Timedelta(minutes=45)) & c["taken"].fillna(True).astype(bool)
+          & (c.confidence >= alert_conf) & (~c.get("closed", pd.Series(False, index=c.index)).fillna(False).astype(bool))]
+    if c.empty:
+        return
+    c = c.sort_values("time", ascending=False).drop_duplicates(["symbol", "side"], keep="first")
+    seen = st.session_state.setdefault("alerts_seen", set())
+    for _, r in c.iterrows():  # pop-up once per new alert
+        if r.key not in seen:
+            seen.add(r.key)
+            st.toast(f"**{'🟢 BUY' if r.side == 'BUY' else '🔴 SELL'} {r.symbol}** @ ₹{r.entry:,.2f} · "
+                     f"{r.confidence:.0f}% · SL ₹{r.stop:,.2f} · T1 ₹{r.t1:,.2f} ({r.source})",
+                     icon="🔔")
+    st.markdown(f"**🔔 Strongest setups now** <span style='opacity:.7;font-size:.85em'>(confidence ≥ "
+                f"{alert_conf}%, last 45 min · tap Open to see the share)</span>", unsafe_allow_html=True)
+    top = c.head(6)
+    cols = st.columns(min(3, len(top)))
+    for i, (_, r) in enumerate(top.iterrows()):
+        colr = UP if r.side == "BUY" else DOWN
+        lp, _dp = live_px(r.symbol)
+        lp = lp or r["last"]
+        pnl = (lp / r.entry - 1) * 100 * (1 if r.side == "BUY" else -1)
+        with cols[i % len(cols)]:
+            st.markdown(
+                f"<div style='border:2px solid {colr};border-radius:12px;padding:8px 12px;margin-bottom:4px'>"
+                f"<div style='display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap'>"
+                f"<b style='color:{colr}'>{'▲ BUY' if r.side == 'BUY' else '▼ SELL'} {r.symbol}</b>"
+                f"<span style='font-size:.8em;opacity:.75'>{r.time:%H:%M} · {r.source} · {r.confidence:.0f}%</span></div>"
+                f"<div style='font-variant-numeric:tabular-nums;font-size:.9em'>Entry ₹{r.entry:,.2f} · now ₹{lp:,.2f} "
+                f"<b style='color:{UP if pnl >= 0 else DOWN}'>{pnl:+.2f}%</b><br>"
+                f"<span style='color:{DOWN}'>SL ₹{r.stop:,.2f}</span> · <span style='color:{UP}'>T1 ₹{r.t1:,.2f}</span> · "
+                f"{STATUS_LABEL.get(r.status, r.status)}</div></div>", unsafe_allow_html=True)
+            if st.button(f"Open {r.symbol} ➜", key=f"al_{r.key}", use_container_width=True):
+                open_stock(r.symbol, "⚡ Scalping" if r.source == "Scalp" else "🎯 Signal")
+
+
+alerts_bar()
 
 
 # ----------------------------------------------------------------------------
@@ -595,7 +884,7 @@ def hold_panel(d_: pd.DataFrame, plan_: dict):
 # ----------------------------------------------------------------------------
 # Tab: Signal & Chart (daily)
 # ----------------------------------------------------------------------------
-with tab_sig:
+if page == "🎯 Signal":
     @st.fragment(run_every=LIVE_EVERY)
     def signal_view():
         try:
@@ -675,7 +964,7 @@ def save_positions(pos_list: list):
         pass
 
 
-with tab_pos:
+if page == "💼 My Positions":
     positions = load_positions()
     with st.expander("➕ Add a stock you bought", expanded=not positions):
         with st.form("add_pos", clear_on_submit=False):
@@ -773,61 +1062,45 @@ with tab_pos:
 
 
 # ----------------------------------------------------------------------------
-# Tab: Breakouts (automatic scan)
+# Page: Breakouts (background engine + live prices)
 # ----------------------------------------------------------------------------
-with tab_brk:
-    st.markdown("Stocks that **just broke** a resistance or support level. "
-                "🟢 **BUY** = breakout upward · 🔴 **SELL** = breakdown. Updates automatically.")
-    b1, b2, b3, b4 = st.columns([1.4, 1, 1, 1])
-    universe_name = b1.selectbox("Stocks to scan", ["Major stocks (~110)", "Scanner watchlist",
-                                                    "All NSE stocks (slow, few minutes)"], key="brk_univ")
-    fresh_days = b2.selectbox("Broke within", [1, 2, 3, 5], index=2,
-                              format_func=lambda n: "today" if n == 1 else f"last {n} days", key="brk_fresh")
-    show = b3.selectbox("Show", ["BUY + SELL", "BUY only", "SELL only"], key="brk_show")
-    major_only = b4.toggle("Major only", value=False, key="brk_major",
-                           help="Strong volume, 52-week levels or several breakouts at once")
-    t1_, t2_ = st.columns(2)
-    rescan_min = t1_.selectbox("Auto re-scan", [1, 2, 5, 0], index=0, key="brk_every",
-                               format_func=lambda m: "Off" if m == 0 else f"every {m} min",
-                               help="Every minute during market hours. 'All NSE stocks' needs 5 min.")
-    brk_strong = t2_.toggle(f"Only strong (≥ {min_conf}% confidence)", value=True, key="brk_strong",
-                            help="Hide breakouts that the trend indicators don't back up")
+if page == "🚀 Breakouts":
+    st.markdown("Stocks that **just broke** a resistance or support level, scanned automatically all day. "
+                "🟢 **BUY** = breakout up · 🔴 **SELL** = breakdown. Prices, % and status move with the live price.")
+    b1, b2, b3, b4 = st.columns(4)
+    show = b1.selectbox("Show", ["BUY + SELL", "BUY only", "SELL only"], key="brk_show")
+    when_f = b2.selectbox("Broke", ["today", "last 3 days"], key="brk_when")
+    major_only = b3.toggle("Major only", value=False, key="brk_major")
+    brk_strong = b4.toggle(f"Only ≥ {min_conf}%", value=True, key="brk_strong")
 
-    if universe_name.startswith("Major"):
-        universe = sorted(S.BUILTIN)
-    elif universe_name.startswith("Scanner"):
-        universe = list(D.DEFAULT_WATCHLIST)
-    else:
-        universe = stocks["SYMBOL"].tolist()
-
-    brk_every = None
-    if rescan_min:
-        brk_every = max(rescan_min, 5 if universe_name.startswith("All") else 0) * 60
-        if not D.market_status()[0]:
-            brk_every = max(brk_every, 900)
-
-    @st.fragment(run_every=brk_every)
+    @st.fragment(run_every=LIVE_EVERY)
     def breakout_view():
-        chunks = [tuple(universe[i:i + 100]) for i in range(0, len(universe), 100)]
-        rows = []
-        bar = st.progress(0, text=f"Scanning {len(universe):,} stocks…") if len(chunks) > 1 else None
-        for i, ch in enumerate(chunks):
-            rows += scan_chunk(ch, fresh_days, 1.5)
-            if bar:
-                bar.progress((i + 1) / len(chunks), text=f"Scanned {min((i + 1) * 100, len(universe)):,} / {len(universe):,}")
-        if bar:
-            bar.empty()
-        res = pd.DataFrame(rows)
+        res = ENGINE.breakouts.copy()
         if res.empty:
-            st.info("No fresh breakouts or breakdowns right now in this list. Try 'last 5 days' or a bigger list.")
+            st.info("The scanner is starting up. The first scan of ~110 stocks takes about a minute; "
+                    "this table fills in by itself.")
             return
-        n_buy, n_sell = int((res.side == "BUY").sum()), int((res.side == "SELL").sum())
-        st.markdown(
-            f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:6px 0 10px'>"
-            f"<span style='background:{UP};color:#fff;padding:6px 14px;border-radius:20px;font-weight:700'>▲ {n_buy} BUY breakouts</span>"
-            f"<span style='background:{DOWN};color:#fff;padding:6px 14px;border-radius:20px;font-weight:700'>▼ {n_sell} SELL breakdowns</span>"
-            f"<span style='color:{NEUTRAL};align-self:center;font-size:.85em'>scanned {pd.Timestamp.now(tz='Asia/Kolkata'):%H:%M} IST · "
-            f"{int(res.major.sum())} major</span></div>", unsafe_allow_html=True)
+        live = [live_px(s) for s in res.symbol]
+        res["price"] = [lp if lp is not None else p for (lp, _), p in zip(live, res.price)]
+        res["day_pct"] = [dp if dp is not None else np.nan for _, dp in live]
+        res["beyond_pct"] = (res.price / res.level - 1) * 100
+        calls = today_calls("Breakout")
+        status, pnl = [], []
+        for _, r in res.iterrows():
+            cc = calls[(calls.symbol == r.symbol) & (calls.side == r.side)] if len(calls) else calls
+            sign = 1 if r.side == "BUY" else -1
+            if len(cc):
+                c0 = cc.iloc[-1]
+                status.append(STATUS_LABEL.get(c0.status, c0.status))
+                pnl.append((r.price / c0.entry - 1) * 100 * sign)
+            else:
+                broke_back = (r.price < r.level) if sign > 0 else (r.price > r.level)
+                status.append(("⚠️ Back below level" if sign > 0 else "⚠️ Back above level") if broke_back
+                              else "Holding beyond level")
+                pnl.append(np.nan)
+        res["status"], res["pnl"] = status, pnl
+        if when_f == "today":
+            res = res[res.days_ago == 0]
         if show == "BUY only":
             res = res[res.side == "BUY"]
         elif show == "SELL only":
@@ -836,47 +1109,44 @@ with tab_brk:
             res = res[res.major]
         if brk_strong:
             res = res[res.confidence >= min_conf]
+        n_buy, n_sell = int((res.side == "BUY").sum()), int((res.side == "SELL").sum())
+        st.markdown(
+            f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:6px 0 10px'>"
+            f"<span style='background:{UP};color:#fff;padding:6px 14px;border-radius:20px;font-weight:700'>▲ {n_buy} BUY</span>"
+            f"<span style='background:{DOWN};color:#fff;padding:6px 14px;border-radius:20px;font-weight:700'>▼ {n_sell} SELL</span>"
+            f"<span style='opacity:.7;align-self:center;font-size:.85em'>🔄 prices "
+            f"{ENGINE.updated['prices']:%H:%M:%S} · scan {ENGINE.updated['scan']:%H:%M:%S} IST</span></div>"
+            if ENGINE.updated["prices"] and ENGINE.updated["scan"] else "", unsafe_allow_html=True)
         if res.empty:
-            st.info("Nothing matches these filters.")
+            st.info("No breakouts match these filters right now.")
             return
         res = res.sort_values(["major", "confidence", "strength"], ascending=False)
         out = pd.DataFrame({
             "Signal": [("🟢 " if s == "BUY" else "🔴 ") + ("MAJOR " if m else "") + s for s, m in zip(res.side, res.major)],
-            "Stock": res.symbol,
-            "Price ₹": res.price.round(2),
-            "Today %": res.day_pct.round(2),
-            "What happened": res.types,
-            "Level broken ₹": res.level.round(2),
-            "Beyond level %": res.beyond_pct.round(2),
-            "Volume × avg": res.vol_x.round(1),
-            "When": res.days_ago.map(lambda n: "today" if n == 0 else f"{n} day{'s' if n > 1 else ''} ago"),
-            "Confidence": res.confidence.round(0),
-            "Stop-loss ₹": res.stop.round(2),
-            "Target 1 ₹": res.t1.round(2),
-            "Target 2 ₹": res.t2.round(2),
-            "Target 3 ₹": res.t3.round(2),
+            "Stock": res.symbol, "Live ₹": res.price, "Today %": res.day_pct, "Status": res.status,
+            "P&L since call %": res.pnl, "What happened": res.types, "Level ₹": res.level,
+            "Beyond %": res.beyond_pct, "Vol ×": res.vol_x, "Confidence": res.confidence,
+            "Stop ₹": res.stop, "T1 ₹": res.t1, "T2 ₹": res.t2, "T3 ₹": res.t3,
+            "Smart filter": [("⛔ " + b) if isinstance(b, str) and b else "✅ OK to trade"
+                             for b in res.get("blocked_by", pd.Series([""] * len(res), index=res.index))],
         })
 
         def colour_signal(v):
-            bg = SIGNAL_BG["STRONG BUY" if "MAJOR BUY" in v else "BUY" if "BUY" in v else
-                           "STRONG SELL" if "MAJOR SELL" in v else "SELL"]
-            return f"background-color:{bg};color:white;font-weight:700"
+            return f"background-color:{UP if 'BUY' in v else DOWN};color:white;font-weight:700"
 
         def colour_num(v):
-            return f"color:{UP if v > 0 else DOWN if v < 0 else NEUTRAL};font-weight:600"
+            return "" if pd.isna(v) else f"color:{UP if v > 0 else DOWN if v < 0 else NEUTRAL};font-weight:600"
 
-        styled = (out.style.map(colour_signal, subset=["Signal"])
-                  .map(colour_num, subset=["Today %", "Beyond level %"])
-                  .map(lambda v: f"color:{UP if v >= 75 else '#ca8a04' if v >= 60 else NEUTRAL};font-weight:700",
-                       subset=["Confidence"])
-                  .map(lambda v: f"color:{DOWN};font-weight:700", subset=["Stop-loss ₹"])
-                  .map(lambda v: f"color:{UP};font-weight:600", subset=["Target 1 ₹", "Target 2 ₹", "Target 3 ₹"])
-                  .format({"Price ₹": "{:,.2f}", "Level broken ₹": "{:,.2f}", "Stop-loss ₹": "{:,.2f}",
-                           "Target 1 ₹": "{:,.2f}", "Target 2 ₹": "{:,.2f}", "Target 3 ₹": "{:,.2f}",
-                           "Today %": "{:+.2f}", "Beyond level %": "{:+.2f}",
-                           "Volume × avg": "{:.1f}×", "Confidence": "{:.0f}%"}))
+        styled = (out.style.map(colour_signal, subset=["Signal"]).map(status_colour, subset=["Status"])
+                  .map(lambda v: f"color:{DOWN};font-weight:600" if "⛔" in v else f"color:{UP};font-weight:700",
+                       subset=["Smart filter"])
+                  .map(colour_num, subset=["Today %", "Beyond %", "P&L since call %"])
+                  .map(lambda v: f"color:{DOWN};font-weight:700", subset=["Stop ₹"])
+                  .map(lambda v: f"color:{UP};font-weight:600", subset=["T1 ₹", "T2 ₹", "T3 ₹"])
+                  .format({"Live ₹": "{:,.2f}", "Level ₹": "{:,.2f}", "Stop ₹": "{:,.2f}", "T1 ₹": "{:,.2f}",
+                           "T2 ₹": "{:,.2f}", "T3 ₹": "{:,.2f}", "Today %": "{:+.2f}", "Beyond %": "{:+.2f}",
+                           "P&L since call %": "{:+.2f}", "Vol ×": "{:.1f}×", "Confidence": "{:.0f}%"}, na_rep="—"))
         st.dataframe(styled, hide_index=True, use_container_width=True, height=min(640, 38 + 35 * len(out)))
-
         o1, o2 = st.columns([3, 1])
         pick_b = o1.selectbox("Open a stock in full analysis", out["Stock"].tolist(), key="brk_open")
         if o2.button("Open ➜", type="primary", key="brk_go"):
@@ -884,11 +1154,318 @@ with tab_brk:
             st.session_state.extra_label = f"{pick_b}  ·  {name.iloc[0] if len(name) else pick_b}"
             st.session_state.symbol = pick_b
             st.session_state.pop("stock_pick", None)
+            st.session_state._goto = "🎯 Signal"
             st.rerun()
-        st.caption("Confidence = how much of the 9 trend indicators agree with the breakout direction. "
-                   "During market hours today's candle is live, so a breakout can still fail by the close.")
+        st.caption("Scans ~110 major NSE stocks every minute on live candles. Every breakout today with enough "
+                   "confidence is logged as a call and tracked in 📊 Live Report. 'Back below level' = the "
+                   "breakout is failing right now.")
 
     breakout_view()
+
+
+# ----------------------------------------------------------------------------
+# Page: Live Report (how many targets hit, how many wrong)
+# ----------------------------------------------------------------------------
+if page == "📊 Live Report":
+    allc = ENGINE.snapshot_calls()
+    today_d = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    days = sorted({t.date() for t in allc["time"]} | {today_d}, reverse=True) if len(allc) else [today_d]
+    r0, r1, r2, r3 = st.columns([1.3, 1, 1, 1])
+    rep_view = r0.selectbox("Show", ["Calls we took (filters on)", "Blocked by smart filters", "All signals"],
+                            key="rep_view")
+    rep_day = r1.selectbox("Day", days, format_func=lambda x: "Today" if x == today_d else x.strftime("%a %d %b"),
+                           key="rep_day")
+    rep_src = r2.selectbox("Calls from", ["All", "Breakout", "Scalp"], key="rep_src")
+    rep_conf = r3.slider("Min confidence", 50, 90, int(min_conf), 5, format="%d%%", key="rep_conf")
+
+    import json as _js
+    _store = ENGINE.store
+    if _store is not None and _store.ok:
+        st.success("💾 Report is saved permanently in your GitHub (branch *report-data*), so a reboot does not "
+                   "lose it" + (f" · last save {_store.last_save:%H:%M}" if _store.last_save else
+                                " · first save within 5 minutes of a new call"))
+        if _store.error:
+            st.caption(f"Last GitHub error: {_store.error}")
+    elif _store is not None:
+        st.error(f"GitHub storage did not connect ({_store.error}). Check GITHUB_TOKEN and GITHUB_REPO in the "
+                 "app's Secrets (📘 Guide).")
+    else:
+        st.warning("⚠️ Right now the report is kept only until the app restarts or is rebooted. To keep it for "
+                   "good, connect GitHub storage once (📘 Guide → *Report hamesha save*). Until then, download a "
+                   "backup every evening.")
+    k1, k2, k3 = st.columns(3)
+    _all = EN.calls_to_json(ENGINE.calls)
+    k1.download_button("⬇️ Backup (to restore later)", _js.dumps(_all), file_name=f"sv_report_backup_{today_d}.json",
+                       mime="application/json", use_container_width=True)
+    _csv = pd.DataFrame(_all).to_csv(index=False) if _all else "no calls yet\n"
+    k2.download_button("⬇️ Excel / CSV", _csv, file_name=f"sv_report_{today_d}.csv", mime="text/csv",
+                       use_container_width=True)
+    _up = k3.file_uploader("⬆️ Restore a backup", type=["json"], key="rep_restore", label_visibility="collapsed")
+    if _up is not None and st.session_state.get("rep_restored") != f"{_up.name}{_up.size}":
+        try:
+            added = ENGINE.merge_calls(_js.load(_up))
+            st.session_state.rep_restored = f"{_up.name}{_up.size}"
+            st.success(f"Restored {added} calls from {_up.name}.")
+        except Exception as e:
+            st.error(f"That file is not an SV report backup ({e}).")
+
+    @st.fragment(run_every=LIVE_EVERY)
+    def report_view():
+        c = ENGINE.snapshot_calls()
+        if c.empty:
+            st.info("No calls yet today. As soon as a breakout or scalp signal fires, it appears here and is "
+                    "tracked live until it hits a target or the stop.")
+            return
+        c = c[c["time"].map(lambda t: t.date()) == rep_day]
+        if rep_src != "All":
+            c = c[c.source == rep_src]
+        c = c[c.confidence >= rep_conf]
+        if "taken" not in c:
+            c["taken"] = True
+        c["taken"] = c["taken"].fillna(True).astype(bool)
+        if "blocked_by" not in c:
+            c["blocked_by"] = ""
+        c["blocked_by"] = c["blocked_by"].fillna("")
+        everything = c.copy()
+        if rep_view.startswith("Calls we took"):
+            c = c[c.taken]
+        elif rep_view.startswith("Blocked"):
+            c = c[~c.taken]
+        if c.empty:
+            st.info("No calls match these filters for this day." + (
+                " The smart filters blocked every signal so far, which is normal in choppy or one-sided markets."
+                if rep_view.startswith("Calls we took") and len(everything) else ""))
+            return
+        for i, r in c.iterrows():  # freshest price for running calls
+            if not r.get("closed", False):
+                lp, _ = live_px(r.symbol)
+                if lp:
+                    c.at[i, "last"] = lp
+        sign = np.where(c.side == "BUY", 1, -1)
+        if "exit" not in c:
+            c["exit"] = np.nan
+        if "avg_px" not in c:
+            c["avg_px"] = np.nan
+        # average of the parts booked at T1/T2/T3/stop + what is still held at the live price
+        live_part = c["last"]
+        px_used = np.where(c["avg_px"].notna(), c["avg_px"],
+                           np.where(c.closed.astype(bool) & c["exit"].notna(), c["exit"], live_part))
+        c["pnl_pct"] = (px_used.astype(float) / c["entry"] - 1) * 100 * sign
+        c["gross_rs"] = c["pnl_pct"] / 100 * trade_amt
+        c["cost_rs"] = [trade_cost(trade_amt, s_) for s_ in c.source]
+        c["net_rs"] = c["gross_rs"] - c["cost_rs"]
+        wins = int((c.stage >= 1).sum())
+        t2 = int((c.stage >= 2).sum())
+        t3 = int((c.stage >= 3).sum())
+        wrong = int((c.status == "Stop hit").sum())
+        running = int(((c.stage == 0) & (~c.closed.astype(bool))).sum())
+        flat = int((c.status == "Closed (no target)").sum())
+        decided = wins + wrong
+        acc = wins / decided * 100 if decided else np.nan
+        acc_col = UP if decided and acc >= 50 else DOWN if decided else NEUTRAL
+
+        def tile(label, value, sub, bg, fg="#fff"):
+            return (f"<div style='background:{bg};color:{fg};border-radius:14px;padding:12px 14px;min-width:0'>"
+                    f"<div style='font-size:.78em;letter-spacing:.06em;text-transform:uppercase;opacity:.85'>{label}</div>"
+                    f"<div style='font-size:2em;font-weight:800;line-height:1.1;font-variant-numeric:tabular-nums'>{value}</div>"
+                    f"<div style='font-size:.8em;opacity:.9'>{sub}</div></div>")
+        st.markdown(
+            "<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:6px 0 12px'>"
+            + tile("Accuracy", "—" if not decided else f"{acc:.0f}%", f"{wins} right of {decided} finished", acc_col)
+            + tile("🎯 Target hit", wins, f"T2 {t2} · T3 {t3}", UP)
+            + tile("❌ Wrong (stop)", wrong, "stop-loss hit before T1", DOWN)
+            + tile("⏳ Running", running, "no target or stop yet", "#ca8a04")
+            + tile("Total calls", len(c), f"{flat} closed with no target", "#334155")
+            + tile("💰 Net P&L after costs", f"₹{c.net_rs.sum():+,.0f}",
+                   f"gross ₹{c.gross_rs.sum():+,.0f} · costs ₹{c.cost_rs.sum():,.0f} · ₹{trade_amt:,.0f}/trade",
+                   UP if c.net_rs.sum() > 0 else DOWN)
+            + "</div>", unsafe_allow_html=True)
+        if decided and acc >= 70 and c.net_rs.sum() <= 0:
+            st.warning("High accuracy but still losing after costs: the wins are too small for the losses and "
+                       "charges. Try a bigger Target 1 size in the sidebar.")
+        stamp("Report updated")
+
+        # per source
+        g = []
+        for src, x in c.groupby("source"):
+            w, l_ = int((x.stage >= 1).sum()), int((x.status == "Stop hit").sum())
+            g.append({"Source": src, "Calls": len(x), "🎯 T1+": w, "T2+": int((x.stage >= 2).sum()),
+                      "🏆 T3": int((x.stage >= 3).sum()), "❌ Wrong": l_,
+                      "⏳ Running": int(((x.stage == 0) & (~x.closed.astype(bool))).sum()),
+                      "Accuracy": (w / (w + l_) * 100) if (w + l_) else np.nan,
+                      "Avg result (R)": float(x.result_r.mean()),
+                      "Net ₹ after costs": float(x.net_rs.sum())})
+        gs = pd.DataFrame(g)
+        st.dataframe(gs.style.format({"Accuracy": "{:.0f}%", "Avg result (R)": "{:+.2f}",
+                                      "Net ₹ after costs": "₹{:+,.0f}"}, na_rep="—")
+                     .map(lambda v: f"color:{UP if v > 0 else DOWN};font-weight:800", subset=["Net ₹ after costs"])
+                     .map(lambda v: "" if pd.isna(v) else f"color:{UP if v >= 50 else DOWN};font-weight:800",
+                          subset=["Accuracy"]), hide_index=True, use_container_width=True)
+
+        # timeline by hour
+        c["hour"] = c["time"].map(lambda t: f"{t.hour:02d}:00")
+        hh = c.assign(win=c.stage >= 1, loss=c.status == "Stop hit",
+                      run=(c.stage == 0) & (~c.closed.astype(bool))).groupby("hour")[["win", "loss", "run"]].sum()
+        fig = go.Figure()
+        fig.add_bar(x=hh.index, y=hh["win"], name="Target hit", marker_color=UP)
+        fig.add_bar(x=hh.index, y=hh["loss"], name="Wrong", marker_color=DOWN)
+        fig.add_bar(x=hh.index, y=hh["run"], name="Running", marker_color="#ca8a04")
+        fig.update_layout(barmode="stack", height=260, margin=dict(l=10, r=10, t=30, b=10),
+                          title="Calls by hour (when the call was made)", legend=dict(orientation="h", y=1.15))
+        show_chart(fig, "report_hours")
+
+        def _first(*ts):
+            for t in ts:
+                if isinstance(t, pd.Timestamp) and not pd.isna(t):
+                    return t
+            return None
+
+        def hit_time(r):
+            t = _first(r.get("close_time"), r.get("t3_time"), r.get("t2_time"), r.get("t1_time"), r.get("stop_time"))
+            return t.strftime("%H:%M") if t is not None else "—"
+
+        def mins(r):
+            t = _first(r.get("t1_time"), r.get("stop_time"))
+            return (t - r.time).total_seconds() / 60 if t is not None else np.nan
+
+        c = c.sort_values("time", ascending=False)
+        tab = pd.DataFrame({
+            "Time": c["time"].map(lambda t: t.strftime("%H:%M")), "Source": c.source, "Stock": c.symbol,
+            "Signal": np.where(c.side == "BUY", "🟢 BUY", "🔴 SELL"),
+            "Status": c.status.map(lambda s: STATUS_LABEL.get(s, s)),
+            "Entry ₹": c.entry, "Avg exit / live ₹": px_used,
+            "P&L %": c.pnl_pct, "Stop ₹": c.stop,
+            "T1 ₹": c.t1, "T2 ₹": c.t2, "T3 ₹": c.t3, "Result at": c.apply(hit_time, axis=1),
+            "Net ₹": c.net_rs, "Minutes to T1/stop": c.apply(mins, axis=1), "Confidence": c.confidence,
+        })
+        st.dataframe(
+            tab.style.map(lambda v: f"background-color:{UP if 'BUY' in v else DOWN};color:white;font-weight:700",
+                          subset=["Signal"]).map(status_colour, subset=["Status"])
+            .map(lambda v: "" if pd.isna(v) else f"color:{UP if v > 0 else DOWN if v < 0 else NEUTRAL};font-weight:700",
+                 subset=["P&L %", "Net ₹"])
+            .format({"Entry ₹": "{:,.2f}", "Avg exit / live ₹": "{:,.2f}", "Stop ₹": "{:,.2f}", "T1 ₹": "{:,.2f}",
+                     "T2 ₹": "{:,.2f}", "T3 ₹": "{:,.2f}", "P&L %": "{:+.2f}", "Net ₹": "₹{:+,.0f}", "Minutes to T1/stop": "{:.0f}",
+                     "Confidence": "{:.0f}%"}, na_rep="—"),
+            hide_index=True, use_container_width=True, height=min(700, 38 + 35 * len(tab)))
+        st.caption("Every call is checked minute by minute against the real high and low. A call counts as "
+                   "**right** once Target 1 is hit (then its stop moves to the entry price, and after T2 to T1). "
+                   "It counts as **wrong** if the stop-loss is hit first. Scalp calls close at 3:15 pm. Breakout "
+                   "calls keep being tracked on the next days. The report runs on the server all day, even when "
+                   "your phone is closed; on free hosting it pauses if the app goes to sleep.")
+
+        # ---- Did the smart filters help today?
+        ev_ = everything[everything.status.isin(["Stop hit"]) | (everything.stage >= 1)]
+        if len(ev_) and (~ev_.taken).any():
+            def _acc(x):
+                w, l_ = int((x.stage >= 1).sum()), int((x.status == "Stop hit").sum())
+                return (w / (w + l_) * 100 if (w + l_) else np.nan), w, l_
+            ta, tw, tl = _acc(ev_[ev_.taken])
+            ba, bw, bl = _acc(ev_[~ev_.taken])
+            helped = pd.notna(ta) and pd.notna(ba) and ta > ba
+            st.markdown("#### 🛡️ Did the smart filters help today?")
+            st.markdown(
+                f"<div style='border:2px solid {UP if helped else DOWN};border-radius:12px;padding:10px 14px'>"
+                f"Calls we <b>took</b>: <b>{'—' if pd.isna(ta) else f'{ta:.0f}%'}</b> right ({tw} ✅ / {tl} ❌) · "
+                f"Calls the filters <b>blocked</b>: <b>{'—' if pd.isna(ba) else f'{ba:.0f}%'}</b> right ({bw} ✅ / {bl} ❌)<br>"
+                f"{'✅ The filters avoided more losers than winners today.' if helped else '⚠️ Today the blocked calls did as well or better: watch this for a few days before changing the settings.'}"
+                f"</div>", unsafe_allow_html=True)
+            rr = ev_[~ev_.taken].assign(reason=ev_[~ev_.taken].blocked_by.str.split("; ")).explode("reason")
+            RULES = [("Market falling", "Against the market (it was falling)"),
+                     ("Market rising", "Against the market (it was rising)"),
+                     ("Midday", "Midday chop 11:00–1:30"), ("Stop-loss hit here", "Right after a stop-loss"),
+                     ("Flip-flop", "BUY↔SELL flip-flop"), ("Already", "Too many calls in this stock"),
+                     ("Chasing", "Chasing a stretched move"), ("Previous call", "Previous call still running"),
+                     ("Too far beyond", "Late breakout entry")]
+            rr["rule"] = rr.reason.map(lambda x: next((lab for k, lab in RULES if str(x).startswith(k)), str(x)))
+            rt_ = rr.groupby("rule").apply(lambda x: pd.Series({
+                "Signals blocked": len(x), "Would have been right": int((x.stage >= 1).sum()),
+                "Would have been wrong": int((x.status == "Stop hit").sum())})).reset_index()
+            rt_["Their accuracy"] = rt_["Would have been right"] / (rt_["Would have been right"] + rt_["Would have been wrong"]).replace(0, np.nan) * 100
+            rt_ = rt_.sort_values("Signals blocked", ascending=False).rename(columns={"rule": "Blocked because"})
+            st.dataframe(rt_.style.format({"Their accuracy": "{:.0f}%"}, na_rep="—")
+                         .map(lambda v: "" if pd.isna(v) else f"color:{UP if v < 50 else DOWN};font-weight:800",
+                              subset=["Their accuracy"]), hide_index=True, use_container_width=True)
+            st.caption("A rule is doing its job when the calls it blocks have LOW accuracy (green). "
+                       "If a rule keeps blocking calls that would have won (red) for several days, loosen it in "
+                       "🛡️ Smart filters in the sidebar.")
+
+        # ---- Why did the losing calls lose?
+        lost = c[c.status == "Stop hit"]
+        won = c[c.stage >= 1]
+        if len(lost) and "mkt30" in c:
+            def flags(x):
+                sg = np.where(x.side == "BUY", 1, -1)
+                m30 = pd.to_numeric(x.get("mkt30"), errors="coerce")
+                bp = pd.to_numeric(x.get("buy_pressure", pd.Series(np.nan, index=x.index)), errors="coerce")
+                vs = pd.to_numeric(x.get("vwap_side", pd.Series(np.nan, index=x.index)), errors="coerce")
+                dm = pd.to_numeric(x.get("day_move", pd.Series(np.nan, index=x.index)), errors="coerce")
+                return pd.DataFrame({
+                    "Market moving against us (30 min)": (m30 * sg) < -0.05,
+                    "Market flat, no clear direction": m30.abs() <= 0.05,
+                    "Price on the wrong side of VWAP": (vs * sg) < 0,
+                    "Volume against us (buyers/sellers)": np.where(sg > 0, bp < 45, bp > 55) & bp.notna(),
+                    "Already moved >1% our way (late)": (dm * sg) > 1.0,
+                    "Stop closer than 0.15%": ((x.entry - x.stop).abs() / x.entry * 100) < 0.15,
+                    "Midday 11:00–1:30": x.time.map(lambda t: 11 * 60 <= t.hour * 60 + t.minute < 13 * 60 + 30),
+                }, index=x.index)
+            fl, fw = flags(lost), flags(won) if len(won) else None
+            tbl = pd.DataFrame({"Warning sign at entry": fl.columns,
+                                "In losing calls": [f"{fl[k].mean() * 100:.0f}%" for k in fl.columns],
+                                "In winning calls": [f"{fw[k].mean() * 100:.0f}%" if fw is not None else "—" for k in fl.columns],
+                                "_gap": [fl[k].mean() - (fw[k].mean() if fw is not None else 0) for k in fl.columns]})
+            tbl = tbl.sort_values("_gap", ascending=False)
+            st.markdown("#### 🔍 Why did the losing calls lose?")
+            st.dataframe(tbl.drop(columns="_gap").style.apply(
+                lambda r_: ["background-color:rgba(220,38,38,.12)" if tbl.loc[r_.name, "_gap"] > 0.1 else ""] * len(r_), axis=1),
+                hide_index=True, use_container_width=True)
+            top = tbl.iloc[0]
+            if top["_gap"] > 0.1:
+                st.info(f"Biggest warning sign today: **{top['Warning sign at entry']}**. It was present in "
+                        f"{top['In losing calls']} of losing calls vs {top['In winning calls']} of winners.")
+            st.caption("Each losing and winning call is checked for these signs at the moment it was given. "
+                       "Signs that show up much more in losers (red rows) are the signals we should not ignore.")
+
+
+        # ---- Aaj ka nateeja (automatic summary + advice)
+        net_day = float(c.net_rs.sum())
+        tips = []
+        if not decided:
+            tips.append("Abhi tak koi call poori nahi hui (na target, na stop). Thodi der baad dekho.")
+        else:
+            if acc >= 60 and net_day > 0:
+                tips.append("Aaj system achha chala. Settings mat badlo, isi tarah 2 hafte chalne do.")
+            if acc >= 70 and net_day <= 0:
+                tips.append("Accuracy achhi hai par paise nahi bache: sidebar mein 'Target 1 size' badha do (½× → ¾× → 1×).")
+            if acc < 50:
+                tips.append("Aaj market mushkil tha. Kal 🎯 High-Accuracy Mode ON rakho aur trade kam lo.")
+            if wrong >= 3 and running == 0 and acc < 40:
+                tips.append("Aaj zyada stop-loss lage: kal pehle 30 minute (9:15–9:45) trade mat lo, market ki disha dekh lo.")
+        if len(c) >= 3:
+            ps = c.groupby("symbol").agg(n=("net_rs", "size"), net=("net_rs", "sum"),
+                                         w=("stage", lambda s: int((s >= 1).sum())))
+            bad = ps[(ps.n >= 3) & (ps.w == 0)]
+            if len(bad):
+                tips.append("Inme aaj ek bhi call sahi nahi hui, kal inse bacho: " + ", ".join(bad.index[:5]) + ".")
+            good = ps[(ps.n >= 2) & (ps.net > 0)].sort_values("net", ascending=False)
+            if len(good):
+                tips.append("Aaj ke sabse achhe stocks: " + ", ".join(good.index[:3]) + ".")
+        hrs = c.assign(h=c["time"].map(lambda t: t.hour), win=c.stage >= 1, loss=c.status == "Stop hit")
+        hh2 = hrs.groupby("h")[["win", "loss"]].sum()
+        hh2 = hh2[(hh2.win + hh2.loss) >= 3]
+        if len(hh2):
+            best_h = (hh2.win / (hh2.win + hh2.loss)).idxmax()
+            tips.append(f"Aaj sabse achha time {best_h}:00–{best_h + 1}:00 raha.")
+        col_v = UP if net_day > 0 else DOWN if decided else NEUTRAL
+        st.markdown("#### 🧾 Aaj ka nateeja")
+        st.markdown(
+            f"<div style='border:2px solid {col_v};border-radius:12px;padding:12px 16px'>"
+            f"<div style='font-size:1.25em;font-weight:800;color:{col_v}'>"
+            + (f"{'Munafa' if net_day > 0 else 'Nuksaan'}: ₹{net_day:+,.0f} (costs ke baad) · accuracy "
+               f"{'—' if not decided else f'{acc:.0f}%'}" if decided else "Report abhi ban rahi hai")
+            + "</div><ul style='margin:8px 0 0 18px;padding:0'>"
+            + "".join(f"<li>{t_}</li>" for t_ in tips) + "</ul></div>", unsafe_allow_html=True)
+
+    report_view()
 
 
 # ----------------------------------------------------------------------------
@@ -956,7 +1533,7 @@ def pattern_card(p: dict):
         unsafe_allow_html=True)
 
 
-with tab_pat:
+if page == "🕯️ Patterns":
     pat_tf = st.selectbox("Timeframe", ["Daily", "15 min", "5 min"], key="pat_tf")
     PAT_EVERY = max(LIVE_EVERY, 10) if LIVE_EVERY else None
 
@@ -1055,7 +1632,54 @@ with tab_pat:
 # ----------------------------------------------------------------------------
 # Tab: Scalping
 # ----------------------------------------------------------------------------
-with tab_scalp:
+if page == "⚡ Scalping":
+    st.markdown("**📡 Scalp radar · all watchlist stocks, live**")
+
+    @st.fragment(run_every=LIVE_EVERY)
+    def radar_view():
+        rd = pd.DataFrame(ENGINE.scalp_now)
+        if rd.empty:
+            st.caption("Radar starting up (first scan takes about a minute).")
+            return
+        rd["live"] = [live_px(s)[0] or p for s, p in zip(rd.symbol, rd.price)]
+        calls = today_calls("Scalp")
+        runs, wins, losses = [], [], []
+        for s_ in rd.symbol:
+            cc = calls[calls.symbol == s_] if len(calls) else calls
+            wins.append(int((cc.stage >= 1).sum()) if len(cc) else 0)
+            losses.append(int((cc.status == "Stop hit").sum()) if len(cc) else 0)
+            op = cc[~cc.closed.astype(bool)] if len(cc) else cc
+            if len(op):
+                o = op.iloc[-1]
+                sg = 1 if o.side == "BUY" else -1
+                runs.append(f"{o.side} @ {o.entry:,.2f} · {STATUS_LABEL.get(o.status, o.status)}")
+            else:
+                runs.append("—")
+        rd["running"], rd["wins"], rd["losses"] = runs, wins, losses
+        rd = rd.assign(active=rd.side != 0).sort_values(["active", "confidence"], ascending=False)
+        bp = rd.get("buy_pressure", pd.Series(50.0, index=rd.index)).fillna(50)
+        out = pd.DataFrame({
+            "Call now": rd.call, "Stock": rd.symbol, "Live ₹": rd.live, "Confidence": rd.confidence,
+            "Buyers / Sellers": [f"{b:.0f}% / {100 - b:.0f}%" for b in bp],
+            "VWAP": ["above" if v > 0 else "below" if v < 0 else "—" for v in rd.get("vwap_side", pd.Series(0, index=rd.index))],
+            "Stop ₹": rd.stop, "T1 ₹": rd.t1, "T2 ₹": rd.t2, "Running call": rd.running,
+            "Today ✅": rd.wins, "Today ❌": rd.losses,
+            "Why no call": [b.split(": ", 1)[-1] if isinstance(b, str) and b else "" for b in rd.get("blocked", pd.Series("", index=rd.index))],
+        })
+        st.dataframe(
+            out.style.map(lambda v: f"background-color:{UP};color:white;font-weight:700" if "BUY" in v else
+                          f"background-color:{DOWN};color:white;font-weight:700" if "SELL" in v else "color:#64748b",
+                          subset=["Call now"])
+            .format({"Live ₹": "{:,.2f}", "Stop ₹": "{:,.2f}", "T1 ₹": "{:,.2f}", "T2 ₹": "{:,.2f}",
+                     "Confidence": "{:.0f}%"}), hide_index=True, use_container_width=True,
+            height=min(460, 38 + 35 * len(out)))
+        if ENGINE.updated["scalp"]:
+            st.caption(f"🔄 Scalp scan {ENGINE.updated['scalp']:%H:%M:%S} · prices {ENGINE.updated['prices']:%H:%M:%S} IST · "
+                       "full accuracy in 📊 Live Report")
+
+    radar_view()
+    st.divider()
+    st.markdown(f"**Detailed scalp view · {symbol}**")
     sc1, sc2 = st.columns(2)
     scalp_tf = sc1.selectbox("Candle", ["1 min", "3 min", "5 min"], key="scalp_tf")
     scalp_conf = sc2.slider("Minimum confidence for a scalp call", 50, 90, max(70, min_conf), 5,
@@ -1077,7 +1701,7 @@ with tab_scalp:
         except Exception:
             pass
         sdf = SC.resample(base, 3) if scalp_tf == "3 min" else base
-        r = SC.scalp_analysis(sdf, scalp_conf)
+        r = SC.scalp_analysis(sdf, scalp_conf, filters=SMART, mkt=ENGINE.market_series())
         tf_min = {"1 min": 1, "3 min": 3, "5 min": 5}[scalp_tf]
         bg = SIGNAL_BG["BUY"] if r["side"] > 0 else SIGNAL_BG["SELL"] if r["side"] < 0 else SIGNAL_BG["HOLD / WAIT"]
         arrow = "▲" if r["side"] > 0 else "▼" if r["side"] < 0 else "■"
@@ -1094,7 +1718,23 @@ with tab_scalp:
             m[1].metric("🛑 Stop", f"{r['stop']:,.2f}", f"{(r['stop'] / r['price'] - 1) * 100:+.2f}%", delta_color="off")
             m[2].metric("🎯 T1 (1R)", f"{r['targets'][0]:,.2f}", f"{(r['targets'][0] / r['price'] - 1) * 100:+.2f}%", delta_color="off")
             m[3].metric("🎯 T2 / T3", f"{r['targets'][1]:,.1f} / {r['targets'][2]:,.1f}")
+            bpv = r["buy_pressure"]
+            m30_txt = "—" if not np.isfinite(r["mkt30"]) else f"{r['mkt30']:+.2f}%"
+            st.markdown(
+                f"<div style='margin:6px 0'><b>Buyers vs sellers (last 15 candles' volume)</b>"
+                f"<div style='display:flex;height:16px;border-radius:8px;overflow:hidden;margin-top:4px'>"
+                f"<div style='width:{bpv:.0f}%;background:{UP}'></div><div style='width:{100 - bpv:.0f}%;background:{DOWN}'></div></div>"
+                f"<div style='display:flex;justify-content:space-between;font-size:.85em'>"
+                f"<span style='color:{UP}'>Buyers {bpv:.0f}%</span><span>Price {'above' if r['vwap_side'] > 0 else 'below'} VWAP · "
+                f"today {r['day_move']:+.2f}% · market 30 min {m30_txt}</span>"
+                f"<span style='color:{DOWN}'>Sellers {100 - bpv:.0f}%</span></div></div>", unsafe_allow_html=True)
             sa, st_ = r["stats_all"], r["stats_today"]
+            su, sb = r["stats_unfiltered"], r["stats_blocked"]
+            if su["decided"]:
+                def _pct(x):
+                    return "—" if np.isnan(x) else f"{x:.0f}%"
+                st.caption(f"🛡️ Smart filters: took {sa['signals']} of {su['signals']} signals. Taken calls "
+                           f"{_pct(sa['win_rate'])} right · blocked calls {_pct(sb['win_rate'])} right (last 5 days).")
             wr = "—" if np.isnan(sa["win_rate"]) else f"{sa['win_rate']:.0f}%"
             wr_t = "—" if np.isnan(st_["win_rate"]) else f"{st_['win_rate']:.0f}%"
             good = not np.isnan(sa["win_rate"]) and sa["win_rate"] >= 50
@@ -1148,7 +1788,7 @@ with tab_scalp:
 # ----------------------------------------------------------------------------
 # Tab: Intraday live
 # ----------------------------------------------------------------------------
-with tab_intra:
+if page == "⏱️ Intraday":
     c1, c2 = st.columns(2)
     interval = c1.selectbox("Candle", ["1m", "5m", "15m"], index=1)
     days = c2.selectbox("Days", [1, 2, 5], index=2)
@@ -1188,7 +1828,7 @@ with tab_intra:
 # ----------------------------------------------------------------------------
 # Tab: Comparison
 # ----------------------------------------------------------------------------
-with tab_cmp:
+if page == "⚖️ vs NIFTY":
     c1, c2 = st.columns([1, 1])
     benches = c1.multiselect("Compare with indices", list(D.BENCHMARKS), default=[bench_name])
     peers_txt = c2.text_input("…and peer stocks (comma separated)", "TCS, INFY" if symbol != "TCS" else "INFY, HCLTECH")
@@ -1281,7 +1921,7 @@ with tab_cmp:
 # ----------------------------------------------------------------------------
 # Tab: Scanner
 # ----------------------------------------------------------------------------
-with tab_scan:
+if page == "🔎 Scanner":
     st.markdown("Scan a watchlist with the same signal engine. Strongest (highest confidence) first.")
     wl = st.text_area("Watchlist (NSE symbols, comma or newline separated)", ", ".join(D.DEFAULT_WATCHLIST), height=90)
     strong_only = st.toggle(f"Only strong signals (≥ {min_conf}% confidence)", value=True, key="scan_strong")
@@ -1351,7 +1991,7 @@ with tab_scan:
 # ----------------------------------------------------------------------------
 # Tab: Backtest
 # ----------------------------------------------------------------------------
-with tab_bt:
+if page == "🧪 Backtest":
     st.markdown("How would the signal engine have done on this stock? Long-only: buy when the score "
                 "crosses the buy level, sell when it falls to the sell level.")
     c1, c2, c3 = st.columns(3)
@@ -1383,7 +2023,7 @@ with tab_bt:
 # ----------------------------------------------------------------------------
 # Tab: Fundamentals
 # ----------------------------------------------------------------------------
-with tab_fund:
+if page == "🏢 Fundamentals":
     f = get_fundamentals(symbol)
     if not f:
         st.info("Fundamentals unavailable for this symbol right now.")
@@ -1409,3 +2049,65 @@ with tab_fund:
         if about:
             with st.expander("About the company"):
                 st.write(about)
+
+
+# ----------------------------------------------------------------------------
+# Page: Guide (sab kuch ek jagah)
+# ----------------------------------------------------------------------------
+if page == "📘 Guide":
+    st.markdown("""
+### 📘 SV Equity Research Analyzer: kaise use karein
+
+**Roz ka tareeka**
+1. **9:15 se pehle** app ek baar khol do. Isse scanner poore din chalta hai aur report banti rehti hai.
+2. Upar **Market bar** dekho: 🟢 *Buyers in control* ho toh BUY calls pe dhyan do, 🔴 *Sellers in control* ho toh SELL calls pe.
+3. **🚀 Breakouts** aur **⚡ Scalping** mein sirf woh calls lo jinka **Smart filter ✅ OK to trade** ho.
+4. Har trade mein **stop-loss zaroor lagao**, wahi jo app batati hai. Target 1 aane pe aadha bech do aur stop ko apne buy price pe le aao.
+5. Kharide hue shares **💼 My Positions** mein daalo. App live batayegi HOLD karo, profit book karo ya SELL.
+6. **3:30 ke baad** **📊 Live Report** dekho: accuracy, Net ₹ (costs ke baad) aur neeche **🧾 Aaj ka nateeja**.
+
+**Rangon ka matlab**
+- 🟢 Hara = BUY / munafa · 🔴 Laal = SELL / nuksaan · ⚪ Grey = WAIT, koi trade nahi
+- ✅ T1 hit = call sahi · ❌ Stop hit = call galat · ⏳ Running = abhi chal rahi hai
+
+**Pehle se lagi settings (inbuilt)**
+- 🎯 **High-Accuracy Mode ON**: sirf A+ setups, din mein lagbhag 5–15 calls.
+- 🛡️ **Smart filters ON**: market ke khilaf trade nahi, 11:00–1:30 chop mein trade nahi, stop-loss ke turant baad usi stock mein dobara trade nahi, ek stock mein din ki max calls, chhote stop nahi, bhaage hue stock ke peeche nahi.
+- **Confidence 60% se kam ho toh WAIT.**
+- Sab sidebar (☰ / ›) mein badal sakte ho, par pehle 2 hafte waise hi chalne do.
+
+**Accuracy vs munafa (zaroor padho)**
+- Sirf accuracy mat dekho. Chhota target rakhne se accuracy 80% ho sakti hai, phir bhi paise ja sakte hain.
+- **Net ₹ after costs** hi asli number hai. Accuracy aur Net ₹, dono achhe hon tabhi system sahi chal raha hai.
+- Ek din se faisla mat karo, **kam se kam 2 hafte** ka report dekho.
+
+**Paisa bachane ke niyam**
+- Ek trade mein apni poonji ka **1% se zyada risk nahi** (sidebar mein "Risk per trade").
+- Din mein 3 stop-loss lag jaayein toh us din aur trade mat lo.
+- RBI policy, budget ya results ke din size kam rakho.
+
+**🔔 Pop-up alerts**
+- Jab kisi share mein bahut mazboot BUY/SELL setup banta hai (sidebar mein chuni confidence, jaise 90% se upar), toh screen ke kone mein **pop-up** aata hai.
+- Har page ke upar **"🔔 Strongest setups now"** mein woh share dikhta hai. **Open ➜** dabao toh woh share khul jayega.
+- 100% ka matlab: saare indicators ek taraf hain. **Guarantee nahi**, stop-loss zaroor lagao.
+- Pop-up tabhi aata hai jab app khuli ho (desktop window ya browser).
+
+**💾 Report hamesha save (ek baar ka setup, 5 minute)**
+Free server reboot pe files mita deta hai. Isliye report aapke GitHub mein save karo:
+1. GitHub pe: profile photo → **Settings** → sabse neeche **Developer settings** → **Personal access tokens** → **Fine-grained tokens** → **Generate new token**.
+2. Naam: `sv-report`. Expiration: 1 saal. **Repository access → Only select repositories → sv-equity-research**.
+3. **Permissions → Repository permissions → Contents → Read and write**. Fir **Generate token** dabao aur token copy kar lo (yeh `github_pat_` se shuru hota hai).
+4. **share.streamlit.io** → apni app ke **⋮ → Settings → Secrets** mein yeh 2 line paste karo aur **Save** dabao:
+```
+GITHUB_TOKEN = "github_pat_yahan_apna_token"
+GITHUB_REPO = "shubhamkcchheda-netizen/sv-equity-research"
+```
+5. App apne aap restart hogi. 📊 Live Report mein hara **"💾 Report is saved permanently"** dikhega.
+
+Report GitHub ki alag branch **report-data** mein save hoti hai, isliye app baar-baar restart nahi hoti. Aapki repository Public hai, toh yeh report (sirf calls, koi personal detail nahi) koi bhi dekh sakta hai. Token kisi ko mat dena.
+
+**Phone pe app**
+- Chrome mein app kholo, ⋮ dabao, fir **Add to Home screen**. Ek tap mein khulegi.
+
+⚠️ *Yeh app padhai aur analysis ke liye hai, investment advice nahi. Har trade ka faisla aur risk aapka apna hai.*
+""")
